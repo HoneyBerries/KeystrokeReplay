@@ -6,28 +6,51 @@ Designed for rhythm games (osu!, Geometry Dash, etc.) where timing accuracy
 is critical. Records keyboard, mouse clicks, mouse movement, and scroll events
 to JSON, then replays them with sub-millisecond timing.
 
-Global hotkeys (active even when the window is not focused):
-  Alt + Shift + R  — Toggle recording on/off
-  Alt + Shift + P  — Start playback of last recording
-  Escape           — Stop an active recording or playback
+Interactive menu controls:
+  1  —  Start a new recording
+  2  —  Play back a saved recording
+  3  —  List saved recordings
+  4  —  Quit
+
+During recording:
+  Alt + Shift + R  —  Stop recording
+  Escape           —  Stop recording
+
+During playback:
+  Escape           —  Stop playback early
 """
 
 import json
-import os
 import sys
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from colorama import Fore, Style, init as _colorama_init
 from pynput import keyboard, mouse
-from pynput.keyboard import HotKey, Key, KeyCode
+from pynput.keyboard import Key, KeyCode
 from pynput.mouse import Button
+
+_colorama_init(autoreset=True)
+
+
+# ── Colour helper ────────────────────────────────────────────────────────────
+
+def _c(text: str, *styles: str) -> str:
+    """Wrap *text* with colorama style codes followed by a hard reset."""
+    return "".join(styles) + str(text) + Style.RESET_ALL
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
+# Recordings are stored under a dedicated folder next to this script so that
+# multiple recordings accumulate and are easy to find.
+RECORDINGS_DIR = Path(__file__).parent / "recordings"
+
+# Kept for the non-interactive --play CLI mode only.
 DEFAULT_RECORDING_PATH = Path("recording.json")
+
 VERSION = 1
 
 
@@ -98,7 +121,9 @@ class Recorder:
         )
         self._kb_listener.start()
         self._ms_listener.start()
-        print("[REC] Recording started — press Alt+Shift+R or Esc to stop.")
+        print(_c("● REC", Fore.RED, Style.BRIGHT)
+              + _c(" Recording started.", Fore.WHITE))
+        print(_c("  Press Alt+Shift+R or Esc to stop.", Fore.YELLOW))
 
     def stop(self) -> list[dict]:
         if not self.is_recording:
@@ -108,13 +133,15 @@ class Recorder:
             self._kb_listener.stop()
         if self._ms_listener:
             self._ms_listener.stop()
-        print(f"[REC] Recording stopped — {len(self._events)} events captured.")
+        print(_c("■ REC", Fore.RED)
+              + _c(f" Recording stopped — {len(self._events)} events captured.",
+                   Fore.WHITE))
         return self._events
 
     def save(self, path: Path = DEFAULT_RECORDING_PATH) -> None:
         """Persist the last recording to *path* as JSON."""
         if not self._events:
-            print("[REC] Nothing to save.")
+            print(_c("[REC] Nothing to save.", Fore.YELLOW))
             return
         duration = self._events[-1]["time"] if self._events else 0.0
         payload = {
@@ -124,8 +151,9 @@ class Recorder:
             "events": self._events,
         }
         path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        print(f"[REC] Saved {len(self._events)} events → {path}")
+        print(_c(f"[REC] Saved {len(self._events)} events → {path}", Fore.GREEN))
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -148,9 +176,11 @@ class Recorder:
     # ── Mouse callbacks ───────────────────────────────────────────────────────
 
     def _on_mouse_move(self, x: int, y: int) -> None:
+        # x and y are absolute screen coordinates provided by pynput.
         self._record({"type": "mouse_move", "time": self._ts(), "x": x, "y": y})
 
     def _on_mouse_click(self, x: int, y: int, button: Button, pressed: bool) -> None:
+        # x and y are absolute screen coordinates provided by pynput.
         self._record({
             "type": "mouse_click",
             "time": self._ts(),
@@ -161,6 +191,8 @@ class Recorder:
         })
 
     def _on_mouse_scroll(self, x: int, y: int, dx: int, dy: int) -> None:
+        # x and y are the absolute position of the cursor at scroll time.
+        # dx and dy are the scroll delta amounts.
         self._record({
             "type": "mouse_scroll",
             "time": self._ts(),
@@ -178,9 +210,14 @@ class Replayer:
 
     Uses a busy-wait (spin-sleep hybrid) in the final microseconds to
     compensate for OS scheduler jitter — important for rhythm games.
+
+    All keyboard keys pressed during replay are tracked and released when
+    replay ends (normally or early) to prevent keys from remaining stuck
+    down on the host system.
     """
 
     SPIN_THRESHOLD = 0.001  # spin for the last 1 ms for precision
+    STOP_CHECK_INTERVAL = 0.050  # poll stop_event every 50 ms during long sleeps
 
     def __init__(self):
         self._kb_ctrl = keyboard.Controller()
@@ -188,15 +225,18 @@ class Replayer:
         self.is_replaying = False
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # Keys currently held down by the replayer; cleared on stop/finish.
+        self._held_keys: set = set()
+        self._held_keys_lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self, events: list[dict]) -> None:
         if self.is_replaying:
-            print("[PLAY] Already replaying.")
+            print(_c("[PLAY] Already replaying.", Fore.YELLOW))
             return
         if not events:
-            print("[PLAY] No events to replay.")
+            print(_c("[PLAY] No events to replay.", Fore.YELLOW))
             return
         self._stop_event.clear()
         self.is_replaying = True
@@ -207,8 +247,10 @@ class Replayer:
             name="replayer",
         )
         self._thread.start()
-        print(f"[PLAY] Playback started — {len(events)} events over "
-              f"{events[-1]['time']:.3f}s. Press Esc to stop.")
+        print(_c("▶ PLAY", Fore.GREEN, Style.BRIGHT)
+              + _c(f" Playback started — {len(events)} events over "
+                   f"{events[-1]['time']:.3f}s.", Fore.WHITE))
+        print(_c("  Press Esc to stop.", Fore.YELLOW))
 
     def stop(self) -> None:
         if not self.is_replaying:
@@ -216,18 +258,47 @@ class Replayer:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=2)
+        # is_replaying is cleared by _run's finally block; set it here too in
+        # case join timed out.
         self.is_replaying = False
-        print("[PLAY] Playback stopped.")
+        print(_c("■ PLAY", Fore.GREEN) + _c(" Playback stopped.", Fore.WHITE))
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
+    def _release_held_keys(self) -> None:
+        """Release every key the replayer is currently holding down.
+
+        Called from the replayer thread's finally block so that keys are
+        always released — whether replay finishes naturally or is aborted.
+        This prevents keyboard keys from getting stuck on Windows after
+        replay ends.
+        """
+        with self._held_keys_lock:
+            for key in list(self._held_keys):
+                try:
+                    self._kb_ctrl.release(key)
+                except Exception:
+                    pass
+            self._held_keys.clear()
+
     def _precise_sleep(self, target_time: float, origin: float) -> None:
-        """Sleep until *origin + target_time* with busy-wait for the tail."""
+        """Sleep until *origin + target_time* with busy-wait for the tail.
+
+        Long coarse sleeps are broken into 50 ms chunks so that a stop signal
+        set by another thread is noticed within ~50 ms rather than after the
+        full inter-event gap.
+        """
+        CHUNK = self.STOP_CHECK_INTERVAL
         deadline = origin + target_time
-        remaining = deadline - time.perf_counter()
-        if remaining > self.SPIN_THRESHOLD:
-            time.sleep(remaining - self.SPIN_THRESHOLD)
-        # Busy-wait for the last millisecond
+        # Coarse sleep phase — check stop_event between each chunk
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= self.SPIN_THRESHOLD:
+                break
+            if self._stop_event.is_set():
+                return
+            time.sleep(min(CHUNK, remaining - self.SPIN_THRESHOLD))
+        # Busy-wait for the last millisecond for high precision
         while time.perf_counter() < deadline:
             pass
 
@@ -242,6 +313,7 @@ class Replayer:
                     break
                 self._dispatch(event)
         finally:
+            self._release_held_keys()
             self.is_replaying = False
 
     def _dispatch(self, event: dict) -> None:
@@ -251,12 +323,17 @@ class Replayer:
         if etype == "key_press":
             key = _str_to_key(event["key"])
             self._kb_ctrl.press(key)
+            with self._held_keys_lock:
+                self._held_keys.add(key)
 
         elif etype == "key_release":
             key = _str_to_key(event["key"])
             self._kb_ctrl.release(key)
+            with self._held_keys_lock:
+                self._held_keys.discard(key)
 
         elif etype == "mouse_move":
+            # Positions are stored as absolute screen coordinates.
             self._ms_ctrl.position = (event["x"], event["y"])
 
         elif etype == "mouse_click":
@@ -273,80 +350,172 @@ class Replayer:
 # ── Session manager ───────────────────────────────────────────────────────────
 
 class Session:
-    """Ties together Recorder, Replayer, and global hotkeys."""
+    """Interactive CLI session with a menu-driven recording and playback flow.
 
-    def __init__(self, recording_path: Path = DEFAULT_RECORDING_PATH):
-        self._path = recording_path
+    After a recording stops the user is automatically returned to the main
+    menu, where they can start another recording, pick a saved one for
+    playback, or quit.
+    """
+
+    BANNER_WIDTH = 60
+
+    def __init__(self, recordings_dir: Path = RECORDINGS_DIR):
+        self._recordings_dir = Path(recordings_dir)
+        self._recordings_dir.mkdir(parents=True, exist_ok=True)
         self._recorder = Recorder()
         self._replayer = Replayer()
         self._events: list[dict] = []
-        self._hotkey_listener: keyboard.Listener | None = None
 
-    # ── Global hotkeys ────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _on_hotkey_record(self) -> None:
-        if self._recorder.is_recording:
-            self._events = self._recorder.stop()
-            self._recorder.save(self._path)
-        else:
-            # Stop any active playback before starting a fresh recording
-            if self._replayer.is_replaying:
-                self._replayer.stop()
-            self._recorder.start()
+    def _available_recordings(self) -> list[Path]:
+        """Return all *.json files in the recordings directory, newest first."""
+        return sorted(self._recordings_dir.glob("*.json"), reverse=True)
 
-    def _on_hotkey_play(self) -> None:
-        if self._replayer.is_replaying:
-            self._replayer.stop()
+    @staticmethod
+    def _new_recording_name() -> str:
+        """Generate a timestamped recording filename."""
+        return datetime.now().strftime("recording_%Y%m%d_%H%M%S.json")
+
+    # ── Display ───────────────────────────────────────────────────────────────
+
+    def _print_banner(self) -> None:
+        w = self.BANNER_WIDTH
+        print(_c("━" * w, Fore.CYAN))
+        print(_c("  KeystrokeReplay", Fore.CYAN, Style.BRIGHT)
+              + _c("  —  high-precision input recorder & replayer", Fore.CYAN))
+        print(_c("━" * w, Fore.CYAN))
+
+    def _print_main_menu(self) -> None:
+        print()
+        print(_c("┌─ Main Menu " + "─" * 47, Fore.BLUE))
+        print(_c("│", Fore.BLUE)
+              + _c("  [1]", Fore.GREEN, Style.BRIGHT)
+              + "  Start new recording")
+        print(_c("│", Fore.BLUE)
+              + _c("  [2]", Fore.GREEN, Style.BRIGHT)
+              + "  Play back a recording")
+        print(_c("│", Fore.BLUE)
+              + _c("  [3]", Fore.CYAN, Style.BRIGHT)
+              + "  List saved recordings")
+        print(_c("│", Fore.BLUE)
+              + _c("  [4]", Fore.RED, Style.BRIGHT)
+              + "  Quit")
+        print(_c("└" + "─" * 58, Fore.BLUE))
+
+    # ── Recording flow ────────────────────────────────────────────────────────
+
+    def _do_record(self) -> None:
+        """Start recording and block until the user stops it, then save."""
+        stop_event = threading.Event()
+
+        def on_stop() -> None:
+            if self._recorder.is_recording:
+                self._events = self._recorder.stop()
+            stop_event.set()
+
+        self._recorder.start()
+        with keyboard.GlobalHotKeys({
+            "<alt>+<shift>+r": on_stop,
+            "<esc>": on_stop,
+        }):
+            stop_event.wait()
+
+        if self._events:
+            path = self._recordings_dir / self._new_recording_name()
+            self._recorder.save(path)
+            print(_c(f"  Saved as: {path.name}", Fore.GREEN))
+
+    # ── Playback flow ─────────────────────────────────────────────────────────
+
+    def _do_playback(self) -> None:
+        """Let the user pick a saved recording and play it back."""
+        recordings = self._available_recordings()
+        if not recordings:
+            print(_c("  No recordings found. Record something first!", Fore.YELLOW))
             return
-        # Load from disk if we don't have in-memory events yet
-        events = self._events or _load_events(self._path)
+
+        print()
+        print(_c("  Available recordings:", Fore.CYAN, Style.BRIGHT))
+        for i, r in enumerate(recordings, 1):
+            print(_c(f"    [{i}]", Fore.GREEN) + f"  {r.name}")
+        print(_c("    [0]", Fore.RED) + "  Back to main menu")
+
+        while True:
+            raw = input(_c("\n  Select recording: ", Fore.CYAN, Style.BRIGHT)).strip()
+            try:
+                idx = int(raw)
+            except ValueError:
+                print(_c("  Please enter a number.", Fore.RED))
+                continue
+            if idx == 0:
+                return
+            if 1 <= idx <= len(recordings):
+                chosen = recordings[idx - 1]
+                break
+            print(_c(f"  Enter a number between 0 and {len(recordings)}.", Fore.RED))
+
+        events = _load_events(chosen)
         if not events:
-            print("[PLAY] No recording found. Record something first (Alt+Shift+R).")
+            print(_c("  Failed to load recording.", Fore.RED))
             return
-        self._replayer.start(events)
 
-    def _on_hotkey_stop(self) -> None:
-        stopped_something = False
-        if self._recorder.is_recording:
-            self._events = self._recorder.stop()
-            self._recorder.save(self._path)
-            stopped_something = True
-        if self._replayer.is_replaying:
+        stop_event = threading.Event()
+
+        def on_stop() -> None:
             self._replayer.stop()
-            stopped_something = True
-        if not stopped_something:
-            print("[ESC] Nothing to stop.")
+            stop_event.set()
+
+        self._replayer.start(events)
+        with keyboard.GlobalHotKeys({"<esc>": on_stop}):
+            while self._replayer.is_replaying and not stop_event.is_set():
+                time.sleep(0.05)
+
+        if not stop_event.is_set():
+            print(_c("  Playback complete.", Fore.GREEN))
+
+    # ── List recordings ───────────────────────────────────────────────────────
+
+    def _do_list(self) -> None:
+        recordings = self._available_recordings()
+        print()
+        if not recordings:
+            print(_c("  No recordings found.", Fore.YELLOW))
+            return
+        print(_c(f"  Recordings in {self._recordings_dir}:", Fore.CYAN, Style.BRIGHT))
+        for r in recordings:
+            size = r.stat().st_size
+            print(_c("    • ", Fore.CYAN) + f"{r.name}"
+                  + _c(f"  ({size:,} bytes)", Fore.WHITE))
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        """Block until the user exits (Ctrl+C or Ctrl+Q)."""
-        print("━━━ KeystrokeReplay ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        print("  Alt + Shift + R  →  toggle recording")
-        print("  Alt + Shift + P  →  start/stop playback")
-        print("  Escape           →  stop recording or playback")
-        print("  Ctrl + C         →  quit")
-        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-        hotkeys = {
-            "<alt>+<shift>+r": self._on_hotkey_record,
-            "<alt>+<shift>+p": self._on_hotkey_play,
-            "<esc>": self._on_hotkey_stop,
-        }
-
-        with keyboard.GlobalHotKeys(hotkeys) as listener:
-            try:
-                listener.join()
-            except KeyboardInterrupt:
-                pass
-            finally:
-                # Clean up any running recorder / replayer
-                if self._recorder.is_recording:
-                    self._events = self._recorder.stop()
-                    self._recorder.save(self._path)
-                if self._replayer.is_replaying:
-                    self._replayer.stop()
-                print("\n[QUIT] Goodbye.")
+        """Show the interactive main menu and handle user input in a loop."""
+        self._print_banner()
+        try:
+            while True:
+                self._print_main_menu()
+                choice = input(_c("  Select: ", Fore.CYAN, Style.BRIGHT)).strip()
+                if choice == "1":
+                    self._do_record()
+                elif choice == "2":
+                    self._do_playback()
+                elif choice == "3":
+                    self._do_list()
+                elif choice == "4":
+                    break
+                else:
+                    print(_c("  Invalid choice. Enter 1–4.", Fore.RED))
+        except (KeyboardInterrupt, EOFError):
+            pass
+        finally:
+            # Ensure nothing is left running when the session exits.
+            if self._recorder.is_recording:
+                self._recorder.stop()
+            if self._replayer.is_replaying:
+                self._replayer.stop()
+            print(_c("\n  Goodbye!", Fore.CYAN, Style.BRIGHT))
 
 
 # ── JSON I/O ─────────────────────────────────────────────────────────────────
@@ -359,10 +528,10 @@ def _load_events(path: Path) -> list[dict]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         events = data.get("events", [])
-        print(f"[LOAD] Loaded {len(events)} events from {path}")
+        print(_c(f"[LOAD] Loaded {len(events)} events from {path}", Fore.CYAN))
         return events
     except (json.JSONDecodeError, KeyError) as exc:
-        print(f"[ERROR] Failed to load {path}: {exc}")
+        print(_c(f"[ERROR] Failed to load {path}: {exc}", Fore.RED))
         return []
 
 
@@ -377,15 +546,15 @@ def main() -> None:
         epilog=__doc__,
     )
     parser.add_argument(
-        "-f", "--file",
-        metavar="PATH",
-        default=str(DEFAULT_RECORDING_PATH),
-        help=f"JSON file for saving/loading recordings (default: {DEFAULT_RECORDING_PATH})",
-    )
-    parser.add_argument(
         "--play",
         metavar="PATH",
         help="Immediately replay a recording from PATH and exit.",
+    )
+    parser.add_argument(
+        "--recordings-dir",
+        metavar="DIR",
+        default=str(RECORDINGS_DIR),
+        help=f"Directory for saving/loading recordings (default: {RECORDINGS_DIR})",
     )
     args = parser.parse_args()
 
@@ -397,7 +566,7 @@ def main() -> None:
         replayer = Replayer()
         done = threading.Event()
 
-        def _wait_for_done():
+        def _wait_for_done() -> None:
             while replayer.is_replaying:
                 time.sleep(0.05)
             done.set()
@@ -411,10 +580,11 @@ def main() -> None:
             replayer.stop()
         return
 
-    # Interactive mode — run the full session with hotkeys
-    session = Session(recording_path=Path(args.file))
+    # Interactive mode — show the menu
+    session = Session(recordings_dir=Path(args.recordings_dir))
     session.run()
 
 
 if __name__ == "__main__":
     main()
+

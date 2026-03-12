@@ -3,7 +3,9 @@ and replay timing accuracy. All tests are fully offline (no real input
 devices are created; pynput listeners are patched away)."""
 
 import json
+import re
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -15,6 +17,7 @@ import keystroke_replay as kr
 from keystroke_replay import (
     Recorder,
     Replayer,
+    Session,
     _button_to_str,
     _key_to_str,
     _load_events,
@@ -110,8 +113,6 @@ class TestRecorder(unittest.TestCase):
     @patch("keystroke_replay.keyboard.Listener")
     @patch("keystroke_replay.mouse.Listener")
     def test_save_creates_valid_json(self, mock_ms, mock_kb):
-        import tempfile
-
         for m in (mock_kb, mock_ms):
             m.return_value.start = MagicMock()
             m.return_value.stop = MagicMock()
@@ -133,6 +134,24 @@ class TestRecorder(unittest.TestCase):
             self.assertEqual(len(data["events"]), 1)
         finally:
             tmp.unlink(missing_ok=True)
+
+    @patch("keystroke_replay.keyboard.Listener")
+    @patch("keystroke_replay.mouse.Listener")
+    def test_save_creates_parent_directories(self, mock_ms, mock_kb):
+        """save() must create intermediate directories if they do not exist."""
+        for m in (mock_kb, mock_ms):
+            m.return_value.start = MagicMock()
+            m.return_value.stop = MagicMock()
+
+        rec = Recorder()
+        rec.start()
+        rec._on_key_press(KeyCode.from_char("x"))
+        rec.stop()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nested = Path(tmpdir) / "deep" / "nested" / "recording.json"
+            rec.save(nested)
+            self.assertTrue(nested.exists())
 
     @patch("keystroke_replay.keyboard.Listener")
     @patch("keystroke_replay.mouse.Listener")
@@ -161,6 +180,27 @@ class TestRecorder(unittest.TestCase):
         ms = next(e for e in events if e["type"] == "mouse_scroll")
         self.assertEqual(ms["dx"], 1)
         self.assertEqual(ms["dy"], 0)
+
+    @patch("keystroke_replay.keyboard.Listener")
+    @patch("keystroke_replay.mouse.Listener")
+    def test_mouse_move_stores_absolute_position(self, mock_ms, mock_kb):
+        """mouse_move events must store absolute x/y coordinates, not deltas."""
+        for m in (mock_kb, mock_ms):
+            m.return_value.start = MagicMock()
+            m.return_value.stop = MagicMock()
+
+        rec = Recorder()
+        rec.start()
+        rec._on_mouse_move(320, 240)
+        rec._on_mouse_move(640, 480)
+        events = rec.stop()
+
+        moves = [e for e in events if e["type"] == "mouse_move"]
+        self.assertEqual(len(moves), 2)
+        self.assertEqual(moves[0]["x"], 320)
+        self.assertEqual(moves[0]["y"], 240)
+        self.assertEqual(moves[1]["x"], 640)
+        self.assertEqual(moves[1]["y"], 480)
 
     @patch("keystroke_replay.keyboard.Listener")
     @patch("keystroke_replay.mouse.Listener")
@@ -281,6 +321,67 @@ class TestReplayer(unittest.TestCase):
                 msg=f"Event at {exp}s was dispatched at {act:.6f}s"
             )
 
+    @patch("keystroke_replay.keyboard.Controller")
+    @patch("keystroke_replay.mouse.Controller")
+    def test_held_keys_released_on_stop(self, mock_ms_ctrl_cls, mock_kb_ctrl_cls):
+        """Keys pressed during replay must be released when stop() is called."""
+        replayer = Replayer()
+        replayer._kb_ctrl = mock_kb_ctrl_cls()
+        replayer._ms_ctrl = mock_ms_ctrl_cls()
+
+        # Two presses; no releases — replay is aborted before they fire.
+        events = [
+            {"type": "key_press", "time": 0.00, "key": "a"},
+            {"type": "key_press", "time": 0.10, "key": "b"},
+            {"type": "key_press", "time": 5.00, "key": "c"},  # never reached
+        ]
+        replayer.start(events)
+        time.sleep(0.25)  # let "a" and "b" be pressed
+        replayer.stop()
+
+        self.assertFalse(replayer.is_replaying)
+        self.assertEqual(len(replayer._held_keys), 0,
+                         "held_keys should be empty after stop()")
+
+    @patch("keystroke_replay.keyboard.Controller")
+    @patch("keystroke_replay.mouse.Controller")
+    def test_held_keys_released_on_natural_finish(self, mock_ms_ctrl_cls, mock_kb_ctrl_cls):
+        """A key pressed but never released in the recording is released on finish."""
+        replayer = Replayer()
+        replayer._kb_ctrl = mock_kb_ctrl_cls()
+        replayer._ms_ctrl = mock_ms_ctrl_cls()
+
+        # Only a press, no corresponding release
+        events = [{"type": "key_press", "time": 0.00, "key": "a"}]
+        replayer.start(events)
+
+        deadline = time.time() + 3.0
+        while replayer.is_replaying and time.time() < deadline:
+            time.sleep(0.02)
+
+        self.assertFalse(replayer.is_replaying)
+        self.assertEqual(len(replayer._held_keys), 0,
+                         "held_keys should be empty after natural finish")
+        # The controller's release() must have been called for the orphaned key.
+        replayer._kb_ctrl.release.assert_called()
+
+    @patch("keystroke_replay.keyboard.Controller")
+    @patch("keystroke_replay.mouse.Controller")
+    def test_mouse_move_uses_absolute_position(self, mock_ms_ctrl_cls, mock_kb_ctrl_cls):
+        """mouse_move replay sets .position (absolute) and never calls .move() (relative)."""
+        replayer = Replayer()
+        replayer._kb_ctrl = mock_kb_ctrl_cls()
+        ms_ctrl = mock_ms_ctrl_cls()
+        replayer._ms_ctrl = ms_ctrl
+
+        # Call _dispatch directly so we can inspect the mock state.
+        replayer._dispatch({"type": "mouse_move", "x": 123, "y": 456})
+
+        # Absolute positioning uses the .position property setter.
+        self.assertEqual(ms_ctrl.position, (123, 456))
+        # Relative movement via .move() must NOT have been called.
+        ms_ctrl.move.assert_not_called()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JSON loading
@@ -293,7 +394,6 @@ class TestLoadEvents(unittest.TestCase):
         self.assertEqual(result, [])
 
     def test_loads_valid_file(self):
-        import tempfile
         events = [{"type": "key_press", "time": 0.0, "key": "a"}]
         payload = {
             "version": 1,
@@ -313,7 +413,6 @@ class TestLoadEvents(unittest.TestCase):
             tmp.unlink(missing_ok=True)
 
     def test_malformed_json_returns_empty(self):
-        import tempfile
         with tempfile.NamedTemporaryFile(
             suffix=".json", mode="w", delete=False, encoding="utf-8"
         ) as f:
@@ -326,5 +425,45 @@ class TestLoadEvents(unittest.TestCase):
             tmp.unlink(missing_ok=True)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Session helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSessionHelpers(unittest.TestCase):
+
+    def test_new_recording_name_format(self):
+        """Generated filename must match recording_YYYYMMDD_HHMMSS.json."""
+        name = Session._new_recording_name()
+        pattern = r"^recording_\d{8}_\d{6}\.json$"
+        self.assertRegex(name, pattern,
+                         f"Unexpected recording name format: {name!r}")
+
+    def test_available_recordings_sorted_newest_first(self):
+        """_available_recordings() must return files newest-first."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            names = [
+                "recording_20240101_120000.json",
+                "recording_20240201_120000.json",
+                "recording_20231201_120000.json",
+            ]
+            for n in names:
+                (d / n).write_text("{}", encoding="utf-8")
+
+            session = Session(recordings_dir=d)
+            recordings = session._available_recordings()
+            result_names = [r.name for r in recordings]
+            self.assertEqual(result_names, sorted(names, reverse=True))
+
+    def test_recordings_dir_created_on_init(self):
+        """Session.__init__ must create the recordings directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            new_dir = Path(tmpdir) / "recs" / "sub"
+            self.assertFalse(new_dir.exists())
+            Session(recordings_dir=new_dir)
+            self.assertTrue(new_dir.is_dir())
+
+
 if __name__ == "__main__":
     unittest.main()
+
