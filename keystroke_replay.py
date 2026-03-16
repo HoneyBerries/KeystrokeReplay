@@ -134,8 +134,13 @@ class Recorder:
             "events": self._events,
         }
         path = Path(path)
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        print(f"[REC] Saved {len(self._events)} events → {path}")
+        # Create parent directory if it doesn't exist
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            print(f"[REC] Saved {len(self._events)} events → {path}")
+        except (OSError, IOError) as e:
+            print(f"[ERROR] Failed to save recording to {path}: {e}")
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
