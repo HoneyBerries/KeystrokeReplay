@@ -33,7 +33,7 @@ VERSION = 1
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _key_to_str(key) -> str:
+def _key_to_str(key: Key | KeyCode) -> str:
     """Serialize a pynput key to a JSON-safe string."""
     if isinstance(key, KeyCode):
         if key.char is not None:
@@ -44,7 +44,7 @@ def _key_to_str(key) -> str:
     return key.name
 
 
-def _str_to_key(s: str):
+def _str_to_key(s: str) -> Key | KeyCode:
     """Deserialize a string back to a pynput key."""
     if s.startswith("<vk:"):
         vk = int(s[4:-1])
@@ -68,24 +68,31 @@ def _str_to_button(s: str) -> Button:
 # ── Recorder ─────────────────────────────────────────────────────────────────
 
 class Recorder:
-    """Captures all input events with high-resolution timestamps."""
+    """Captures all input events with high-resolution timestamps.
+
+    Records keyboard presses/releases, mouse clicks, mouse movement,
+    and scroll wheel events with microsecond precision timestamps.
+    """
 
     def __init__(self):
+        """Initialize the recorder with empty event list and default state."""
         self._events: list[dict] = []
         self._start: float = 0.0
         self._lock = threading.Lock()
         self._kb_listener: keyboard.Listener | None = None
         self._ms_listener: mouse.Listener | None = None
         self.is_recording = False
+        self._recording_lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        if self.is_recording:
-            return
-        self._events = []
-        self._start = time.perf_counter()
-        self.is_recording = True
+        with self._recording_lock:
+            if self.is_recording:
+                return
+            self._events = []
+            self._start = time.perf_counter()
+            self.is_recording = True
 
         self._kb_listener = keyboard.Listener(
             on_press=self._on_key_press,
@@ -101,13 +108,16 @@ class Recorder:
         print("[REC] Recording started — press Alt+Shift+R or Esc to stop.")
 
     def stop(self) -> list[dict]:
-        if not self.is_recording:
-            return self._events
-        self.is_recording = False
+        with self._recording_lock:
+            if not self.is_recording:
+                return self._events
+            self.is_recording = False
         if self._kb_listener:
             self._kb_listener.stop()
+            self._kb_listener.join()
         if self._ms_listener:
             self._ms_listener.stop()
+            self._ms_listener.join()
         print(f"[REC] Recording stopped — {len(self._events)} events captured.")
         return self._events
 
@@ -116,7 +126,7 @@ class Recorder:
         if not self._events:
             print("[REC] Nothing to save.")
             return
-        duration = self._events[-1]["time"] if self._events else 0.0
+        duration = self._events[-1]["time"]
         payload = {
             "version": VERSION,
             "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -124,8 +134,13 @@ class Recorder:
             "events": self._events,
         }
         path = Path(path)
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        print(f"[REC] Saved {len(self._events)} events → {path}")
+        # Create parent directory if it doesn't exist
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            print(f"[REC] Saved {len(self._events)} events → {path}")
+        except (OSError, IOError) as e:
+            print(f"[ERROR] Failed to save recording to {path}: {e}")
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -140,35 +155,50 @@ class Recorder:
     # ── Keyboard callbacks ────────────────────────────────────────────────────
 
     def _on_key_press(self, key) -> None:
-        self._record({"type": "key_press", "time": self._ts(), "key": _key_to_str(key)})
+        try:
+            self._record({"type": "key_press", "time": self._ts(), "key": _key_to_str(key)})
+        except Exception as e:
+            print(f"[ERROR] Failed to record key press: {e}")
 
     def _on_key_release(self, key) -> None:
-        self._record({"type": "key_release", "time": self._ts(), "key": _key_to_str(key)})
+        try:
+            self._record({"type": "key_release", "time": self._ts(), "key": _key_to_str(key)})
+        except Exception as e:
+            print(f"[ERROR] Failed to record key release: {e}")
 
     # ── Mouse callbacks ───────────────────────────────────────────────────────
 
     def _on_mouse_move(self, x: int, y: int) -> None:
-        self._record({"type": "mouse_move", "time": self._ts(), "x": x, "y": y})
+        try:
+            self._record({"type": "mouse_move", "time": self._ts(), "x": x, "y": y})
+        except Exception as e:
+            print(f"[ERROR] Failed to record mouse move: {e}")
 
     def _on_mouse_click(self, x: int, y: int, button: Button, pressed: bool) -> None:
-        self._record({
-            "type": "mouse_click",
-            "time": self._ts(),
-            "x": x,
-            "y": y,
-            "button": _button_to_str(button),
-            "pressed": pressed,
-        })
+        try:
+            self._record({
+                "type": "mouse_click",
+                "time": self._ts(),
+                "x": x,
+                "y": y,
+                "button": _button_to_str(button),
+                "pressed": pressed,
+            })
+        except Exception as e:
+            print(f"[ERROR] Failed to record mouse click: {e}")
 
     def _on_mouse_scroll(self, x: int, y: int, dx: int, dy: int) -> None:
-        self._record({
-            "type": "mouse_scroll",
-            "time": self._ts(),
-            "x": x,
-            "y": y,
-            "dx": dx,
-            "dy": dy,
-        })
+        try:
+            self._record({
+                "type": "mouse_scroll",
+                "time": self._ts(),
+                "x": x,
+                "y": y,
+                "dx": dx,
+                "dy": dy,
+            })
+        except Exception as e:
+            print(f"[ERROR] Failed to record mouse scroll: {e}")
 
 
 # ── Replayer ──────────────────────────────────────────────────────────────────
@@ -183,23 +213,30 @@ class Replayer:
     SPIN_THRESHOLD = 0.001  # spin for the last 1 ms for precision
 
     def __init__(self):
+        """Initialize the replayer with keyboard/mouse controllers and threading state."""
         self._kb_ctrl = keyboard.Controller()
         self._ms_ctrl = mouse.Controller()
         self.is_replaying = False
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._replay_lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self, events: list[dict]) -> None:
-        if self.is_replaying:
-            print("[PLAY] Already replaying.")
-            return
-        if not events:
-            print("[PLAY] No events to replay.")
-            return
-        self._stop_event.clear()
-        self.is_replaying = True
+        with self._replay_lock:
+            if self.is_replaying:
+                print("[PLAY] Already replaying.")
+                return
+            if not events:
+                print("[PLAY] No events to replay.")
+                return
+            # Stop any existing thread before starting a new one
+            if self._thread and self._thread.is_alive():
+                self._stop_event.set()
+                self._thread.join(timeout=2)
+            self._stop_event.clear()
+            self.is_replaying = True
         self._thread = threading.Thread(
             target=self._run,
             args=(events,),
@@ -211,24 +248,34 @@ class Replayer:
               f"{events[-1]['time']:.3f}s. Press Esc to stop.")
 
     def stop(self) -> None:
-        if not self.is_replaying:
-            return
-        self._stop_event.set()
+        with self._replay_lock:
+            if not self.is_replaying:
+                return
+            self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=2)
-        self.is_replaying = False
+        with self._replay_lock:
+            self.is_replaying = False
         print("[PLAY] Playback stopped.")
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _precise_sleep(self, target_time: float, origin: float) -> None:
-        """Sleep until *origin + target_time* with busy-wait for the tail."""
+        """Sleep until *origin + target_time* with busy-wait for the tail.
+
+        Uses a hybrid approach: sleeps for most of the duration, then spins
+        for the final millisecond to achieve sub-millisecond precision.
+        Includes a timeout safeguard to prevent infinite spinning.
+        """
         deadline = origin + target_time
         remaining = deadline - time.perf_counter()
         if remaining > self.SPIN_THRESHOLD:
             time.sleep(remaining - self.SPIN_THRESHOLD)
-        # Busy-wait for the last millisecond
-        while time.perf_counter() < deadline:
+        # Busy-wait for the last millisecond with timeout safeguard
+        max_spins = 1000000  # Safety limit to prevent infinite loop
+        spins = 0
+        while time.perf_counter() < deadline and spins < max_spins:
+            spins += 1
             pass
 
     def _run(self, events: list[dict]) -> None:
@@ -242,40 +289,62 @@ class Replayer:
                     break
                 self._dispatch(event)
         finally:
-            self.is_replaying = False
+            with self._replay_lock:
+                self.is_replaying = False
 
     def _dispatch(self, event: dict) -> None:
         """Execute a single recorded event."""
-        etype = event["type"]
+        try:
+            etype = event.get("type")
+            if not etype:
+                print(f"[WARN] Event missing 'type' field: {event}")
+                return
 
-        if etype == "key_press":
-            key = _str_to_key(event["key"])
-            self._kb_ctrl.press(key)
+            if etype == "key_press":
+                key = _str_to_key(event["key"])
+                self._kb_ctrl.press(key)
 
-        elif etype == "key_release":
-            key = _str_to_key(event["key"])
-            self._kb_ctrl.release(key)
+            elif etype == "key_release":
+                key = _str_to_key(event["key"])
+                self._kb_ctrl.release(key)
 
-        elif etype == "mouse_move":
-            self._ms_ctrl.position = (event["x"], event["y"])
+            elif etype == "mouse_move":
+                self._ms_ctrl.position = (event["x"], event["y"])
 
-        elif etype == "mouse_click":
-            button = _str_to_button(event["button"])
-            if event["pressed"]:
-                self._ms_ctrl.press(button)
+            elif etype == "mouse_click":
+                button = _str_to_button(event["button"])
+                if event["pressed"]:
+                    self._ms_ctrl.press(button)
+                else:
+                    self._ms_ctrl.release(button)
+
+            elif etype == "mouse_scroll":
+                self._ms_ctrl.scroll(event["dx"], event["dy"])
+
             else:
-                self._ms_ctrl.release(button)
+                print(f"[WARN] Unknown event type '{etype}', skipping event: {event}")
 
-        elif etype == "mouse_scroll":
-            self._ms_ctrl.scroll(event["dx"], event["dy"])
+        except KeyError as e:
+            print(f"[ERROR] Event missing required field {e}: {event}")
+        except Exception as e:
+            print(f"[ERROR] Failed to dispatch event: {e}, event: {event}")
 
 
 # ── Session manager ───────────────────────────────────────────────────────────
 
 class Session:
-    """Ties together Recorder, Replayer, and global hotkeys."""
+    """Ties together Recorder, Replayer, and global hotkeys.
+
+    Manages the interactive session with hotkey bindings for recording
+    and playback control.
+    """
 
     def __init__(self, recording_path: Path = DEFAULT_RECORDING_PATH):
+        """Initialize the session with the specified recording path.
+
+        Args:
+            recording_path: Path where recordings will be saved/loaded.
+        """
         self._path = recording_path
         self._recorder = Recorder()
         self._replayer = Replayer()
@@ -284,10 +353,14 @@ class Session:
 
     # ── Global hotkeys ────────────────────────────────────────────────────────
 
+    def _stop_and_save_recording(self) -> None:
+        """Helper method to stop recording and save to disk."""
+        self._events = self._recorder.stop()
+        self._recorder.save(self._path)
+
     def _on_hotkey_record(self) -> None:
         if self._recorder.is_recording:
-            self._events = self._recorder.stop()
-            self._recorder.save(self._path)
+            self._stop_and_save_recording()
         else:
             # Stop any active playback before starting a fresh recording
             if self._replayer.is_replaying:
@@ -308,8 +381,7 @@ class Session:
     def _on_hotkey_stop(self) -> None:
         stopped_something = False
         if self._recorder.is_recording:
-            self._events = self._recorder.stop()
-            self._recorder.save(self._path)
+            self._stop_and_save_recording()
             stopped_something = True
         if self._replayer.is_replaying:
             self._replayer.stop()
@@ -342,8 +414,7 @@ class Session:
             finally:
                 # Clean up any running recorder / replayer
                 if self._recorder.is_recording:
-                    self._events = self._recorder.stop()
-                    self._recorder.save(self._path)
+                    self._stop_and_save_recording()
                 if self._replayer.is_replaying:
                     self._replayer.stop()
                 print("\n[QUIT] Goodbye.")
@@ -351,7 +422,7 @@ class Session:
 
 # ── JSON I/O ─────────────────────────────────────────────────────────────────
 
-def _load_events(path: Path) -> list[dict]:
+def _load_events(path: str | Path) -> list[dict]:
     """Load events from a JSON recording file."""
     path = Path(path)
     if not path.exists():
@@ -361,7 +432,7 @@ def _load_events(path: Path) -> list[dict]:
         events = data.get("events", [])
         print(f"[LOAD] Loaded {len(events)} events from {path}")
         return events
-    except (json.JSONDecodeError, KeyError) as exc:
+    except json.JSONDecodeError as exc:
         print(f"[ERROR] Failed to load {path}: {exc}")
         return []
 
